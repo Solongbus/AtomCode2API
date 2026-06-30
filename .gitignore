@@ -9,5 +9,8 @@ __pycache__/
 test_final.py
 
 output/
+dist/
+build/
+ref/
 
 _buildEXE.bat

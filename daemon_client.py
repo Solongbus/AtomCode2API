@@ -122,8 +122,21 @@ SSEEvent = Union[
 
 @dataclass
 class ChatRequest:
-    """Mirrors what the VS Code extension sends to POST /chat."""
-    messages: list[dict]  # [{role, content, ...}]
+    """Mirrors what the VS Code extension sends to POST /chat.
+
+    The daemon expects the **single-string** ``message`` + ``working_dir``
+    format (the same format the VS Code extension always uses).  When
+    ``working_dir`` is set, the daemon knows which project to operate on
+    and will run the full coding-agent workflow (tool calls, file
+    read/write, etc.).
+
+    The ``messages`` field is kept for backward compatibility (used by the
+    legacy CLI-mode path), but the daemon-mode path should always prefer
+    ``message`` + ``working_dir``.
+    """
+    message: str = ""              # Single user prompt (preferred)
+    working_dir: str = ""          # Project workspace directory
+    messages: list[dict] = field(default_factory=list)  # legacy array format
     model: Optional[str] = None
     provider: Optional[str] = None
     stream: bool = True
@@ -333,11 +346,44 @@ class DaemonClient:
         POST /chat — SSE streaming chat.
 
         Yields typed SSEEvent objects that mirror the daemon's event types.
+
+        The daemon's ``/chat`` endpoint recognises **two** request shapes:
+
+        **Agent mode** (preferred – full coding-agent workflow)
+        -------------------------------------------------------
+        .. code:: json
+
+            {
+              "message": "Create a login page …",
+              "working_dir": "C:/Projects/myapp",
+              "session_id": "abc-123",
+              "stream": true
+            }
+
+        **Chat mode** (legacy – simple Q&A, no tool execution)
+        ------------------------------------------------------
+        .. code:: json
+
+            {
+              "messages": [{"role": "user", "content": "…"}],
+              "session_id": "abc-123",
+              "stream": true
+            }
+
+        This method sends **agent mode** when ``req.message`` is non-empty
+        (the daemon-mode path) and falls back to **chat mode** when only
+        ``req.messages`` is populated (the legacy path).
         """
-        payload = {
-            "messages": req.messages,
-            "stream": req.stream,
-        }
+        # ── Build payload ────────────────────────────────────────────────
+        # Use the VS Code extension format (message + working_dir) when
+        # available – this triggers the full coding-agent workflow.
+        payload: dict[str, Any] = {"stream": req.stream}
+        if req.message:
+            payload["message"] = req.message
+            if req.working_dir:
+                payload["working_dir"] = req.working_dir
+        else:
+            payload["messages"] = req.messages
         if req.model:
             payload["model"] = req.model
         if req.provider:

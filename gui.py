@@ -194,7 +194,7 @@ class Dashboard(QMainWindow):
         grid.addWidget(copy_btn(base_url), 0, 2)
 
         # ── Row 1: API Key ─────────────────────────────────────────
-        api_key = settings.api_key or "(未设置)"
+        api_key = settings.api_key or "atomcode2api-local-dev-key"
         grid.addWidget(QLabel("API Key:"), 1, 0)
         grid.addWidget(value_label(api_key), 1, 1)
         grid.addWidget(copy_btn(settings.api_key or ""), 1, 2)

@@ -36,6 +36,14 @@ import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
+
+# PyInstaller --windowed mode strips the console, making sys.std{out,err} == None.
+# uvicorn's logging formatter calls .isatty() on sys.stderr, which crashes on None.
+# Must be at module level, before any uvicorn import.
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
 from pathlib import Path
 from typing import Any, AsyncGenerator, List, Optional
 
@@ -102,7 +110,7 @@ else:
             STATUS_QUEUED,
             STATUS_RUNNING,
         )
-        from atomcode2api.utils.locker import check_locked
+        from atomcode2api.utils.locker import clear_all_locks
     except ModuleNotFoundError:
         from utils.executor import (
             get_task,
@@ -113,7 +121,7 @@ else:
             STATUS_QUEUED,
             STATUS_RUNNING,
         )
-        from utils.locker import check_locked
+        from utils.locker import clear_all_locks
 
 # ── Python 3.9 compatibility: fix pydantic json_schema ──────────────────
 if sys.version_info < (3, 10):
@@ -168,6 +176,10 @@ async def lifespan(app: FastAPI):
         "atomcode2api starting  mode=%s  host=%s  port=%d",
         settings.mode, settings.host, settings.port,
     )
+
+    # Clear stale lock files from the temp directory so that leftover
+    # locks from a previous crash never block subsequent conversations.
+    clear_all_locks()
 
     if settings.mode == "daemon":
         global _daemon_client, _daemon_manager
@@ -353,20 +365,37 @@ if settings.mode != "daemon":
         model: str,
         request: Request,
     ):
-        """Async generator that streams atomcode CLI logs as OpenAI SSE chunks."""
+        """Async generator that streams atomcode CLI logs as OpenAI SSE chunks.
+
+        Sends periodic SSE keep-alive comments (every 5 s) while waiting
+        for the subprocess to produce output, so the IDE connection never
+        times out during the AI's "thinking" phase.
+        """
         logger.info("[openai][cli] stream enter task=%s project=%s", task_id, project_path)
         last_log_len = 0
         yielded_any_chunk = False
+        last_keepalive = time.monotonic()
+        KEEPALIVE_INTERVAL = 5.0  # seconds
+        accumulated_content = ""
+
         while True:
             record = get_task(task_id)
             if record is None:
                 logger.warning("[openai][cli] stream missing task record task=%s", task_id)
                 break
+
+            # ── Read new logs ──────────────────────────────────────────
             new_logs = record["logs"][last_log_len:]
-            for line in new_logs.splitlines(keepends=True):
-                yielded_any_chunk = True
-                yield _sse_chunk(task_id, model, {"content": line})
-            last_log_len = len(record["logs"])
+            if new_logs:
+                for line in new_logs.splitlines(keepends=True):
+                    yielded_any_chunk = True
+                    chunk_str = _sse_chunk(task_id, model, {"content": line})
+                    accumulated_content += line
+                    yield chunk_str
+                last_log_len = len(record["logs"])
+                last_keepalive = time.monotonic()  # reset keepalive on real data
+
+            # ── Check terminal status ──────────────────────────────────
             if record["status"] in (STATUS_COMPLETED, STATUS_FAILED):
                 logger.info(
                     "[openai][cli] stream exit task=%s final_status=%s logs_len=%d",
@@ -375,15 +404,33 @@ if settings.mode != "daemon":
                     len(record["logs"]),
                 )
                 break
+
+            # ── Client disconnect ──────────────────────────────────────
             if await request.is_disconnected():
                 logger.warning("[openai][cli] stream disconnected task=%s", task_id)
                 break
+
+            # ── First chunk: set role ──────────────────────────────────
             if not yielded_any_chunk:
                 yielded_any_chunk = True
-                yield _sse_chunk(task_id, model, {"role": "assistant"})
-            await asyncio.sleep(0.2)
+                # OpenAI-compatible first chunk: role + empty content
+                yield _sse_chunk(task_id, model, {"role": "assistant", "content": ""})
+                last_keepalive = time.monotonic()
+
+            # ── Keep-alive heartbeat ───────────────────────────────────
+            elif time.monotonic() - last_keepalive >= KEEPALIVE_INTERVAL:
+                yield ": keepalive\n\n"
+                last_keepalive = time.monotonic()
+
+            await asyncio.sleep(0.1)  # poll interval
+
         yield _sse_chunk(task_id, model, {}, finish_reason="stop")
         yield "data: [DONE]\n\n"
+        logger.info(
+            "[openai][cli] stream done task=%s total_content_len=%d",
+            task_id,
+            len(accumulated_content),
+        )
 
 
 # ── /api/v1/agent/coding ────────────────────────────────────────────────
@@ -417,10 +464,11 @@ async def trigger_coding(body: CodingRequest, background_tasks: BackgroundTasks)
         if _daemon_client is not None:
             _init_task(task_id, body.prompt, body.project_path, session_id)
 
-        # Launch streaming in background
+        # Launch streaming in background — use VS Code extension message format
         background_tasks.add_task(
             _run_daemon_task, task_id, DCR(
-                messages=[{"role": "user", "content": body.prompt}],
+                message=body.prompt,
+                working_dir=body.project_path,
                 session_id=session_id,
             )
         )
@@ -770,22 +818,27 @@ async def _chat_completions_daemon(body: OpenAIChatRequest, request: Request):
         except Exception as exc:
             logger.warning("Could not change daemon working dir to %s: %s", project_path, exc)
 
-    # Convert OpenAI messages to daemon format
-    daemon_messages = []
-    for msg in body.messages:
-        m: dict = {"role": msg.role}
-        if msg.content:
-            m["content"] = msg.content
-        if msg.tool_calls:
-            m["tool_calls"] = msg.tool_calls
-        if msg.tool_call_id:
-            m["tool_call_id"] = msg.tool_call_id
-        daemon_messages.append(m)
+    # Convert OpenAI messages → daemon single-string message
+    # The daemon expects the VS-Code-extension format:
+    #   { "message": "…", "working_dir": "…", "session_id": "…" }
+    # which triggers the full coding-agent workflow (tools, artifacts, …).
+    # DO NOT send the "messages" array — that makes the daemon treat it
+    # as a simple Q&A without agent capabilities.
+    user_message = ""
+    for msg in reversed(body.messages):
+        if msg.role == "user" and msg.content:
+            user_message = msg.content
+            break
 
-    # Create chat request for daemon
-    logger.info("[openai][daemon] daemon_messages=%d session_id=%s", len(daemon_messages), body.session_id)
+    logger.info(
+        "[openai][daemon] message=%s  working_dir=%s  session_id=%s",
+        user_message[:120],
+        project_path,
+        body.session_id,
+    )
     chat_req = ChatRequest(
-        messages=daemon_messages,
+        message=user_message,
+        working_dir=project_path,
         model=body.model if body.model != "atomcode" else None,
         stream=True,
         session_id=body.session_id,
@@ -877,83 +930,166 @@ async def _stream_daemon_sse(
     model: str,
     request: Request,
 ) -> AsyncGenerator[str, None]:
-    """Translate daemon SSE events → OpenAI chat.completion.chunk SSE."""
+    """Translate daemon SSE events → OpenAI chat.completion.chunk SSE.
+
+    Includes periodic SSE keep-alive comments during long pauses
+    (AI thinking / tool execution) so the IDE never times out.
+    """
     response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     artifact_buffer: dict[str, str] = {}
     tool_calls_acc: dict[str, dict] = {}
-    sent_content_prefix = False
 
-    async for event in _daemon_client.stream_chat(chat_req):
-        if await request.is_disconnected():
-            break
+    # ── Keep-alive task ──────────────────────────────────────────────────
+    # Send a "noop" SSE comment every 10 seconds while no real event
+    # arrives.  This keeps the HTTP connection alive during long AI
+    # thinking or tool-execution pauses.
+    KEEPALIVE_INTERVAL = 10.0
 
-        if isinstance(event, SSEText):
-            delta = {"content": event.content}
-            yield _sse_chunk(response_id, model, delta)
+    async def _keepalive() -> AsyncGenerator[str, None]:
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+            yield ": keepalive\n\n"
 
-        elif isinstance(event, SSEToolBatch):
-            # Emit tool call deltas (OpenAI streaming format)
-            for tc in event.calls:
-                idx = len(tool_calls_acc)
-                tool_calls_acc[tc.id] = tc
-                delta = {
-                    "tool_calls": [{
-                        "index": idx,
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
-                    }]
-                }
-                yield _sse_chunk(response_id, model, delta)
+    keepalive_gen = _keepalive()
+    # We'll interleave keep-alive via asyncio.wait / queue below.
 
-        elif isinstance(event, SSEToolResult):
-            # Display tool result as content text
-            delta = {"content": f"\n\n**Tool result ({event.name}):**\n{event.output}\n"}
-            yield _sse_chunk(response_id, model, delta)
+    # ── Process events ───────────────────────────────────────────────────
+    event_iter = _daemon_client.stream_chat(chat_req)
+    next_event_task: Optional[asyncio.Task] = None
+    keepalive_task: Optional[asyncio.Task] = None
 
-        elif isinstance(event, SSEArtifactStart):
-            artifact_buffer[event.id] = ""
-            delta = {"content": f"\n\n```{event.language}\n"}
-            yield _sse_chunk(response_id, model, delta)
+    try:
+        # Prime: start fetching the first event
+        next_event_task = asyncio.ensure_future(event_iter.__anext__())
+        keepalive_task = asyncio.ensure_future(keepalive_gen.__anext__())
 
-        elif isinstance(event, SSEArtifactContent):
-            if event.id in artifact_buffer:
-                artifact_buffer[event.id] += event.content
+        while True:
+            if await request.is_disconnected():
+                logger.info("[openai][daemon] client disconnected, stopping stream")
+                return
+
+            done_set, _ = await asyncio.wait(
+                [next_event_task, keepalive_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if keepalive_task in done_set:
+                # Keep-alive timer fired — send a heartbeat
+                yield ": keepalive\n\n"
+                keepalive_task = asyncio.ensure_future(keepalive_gen.__anext__())
+                continue
+
+            # An event arrived
+            try:
+                event = next_event_task.result()
+            except StopAsyncIteration:
+                # No more events from daemon — stream is over
+                break
+            except Exception as exc:
+                logger.error("[openai][daemon] stream error: %s", exc)
+                break
+            finally:
+                next_event_task = None
+
+            # Cancel the pending keepalive and schedule next event
+            if keepalive_task and not keepalive_task.done():
+                keepalive_task.cancel()
+            keepalive_task = asyncio.ensure_future(keepalive_gen.__anext__())
+            next_event_task = asyncio.ensure_future(event_iter.__anext__())
+
+            # ── Handle typed events ──────────────────────────────────────
+            if isinstance(event, SSEText):
+                logger.debug("[openai][daemon] text chunk len=%d", len(event.content))
                 delta = {"content": event.content}
                 yield _sse_chunk(response_id, model, delta)
 
-        elif isinstance(event, SSEArtifactEnd):
-            if event.id in artifact_buffer:
-                yield _sse_chunk(response_id, model, {"content": "\n```\n"})
-                artifact_buffer.pop(event.id, None)
+            elif isinstance(event, SSEToolBatch):
+                logger.info("[openai][daemon] tool_batch calls=%d", len(event.calls))
+                for tc in event.calls:
+                    idx = len(tool_calls_acc)
+                    tool_calls_acc[tc.id] = tc
+                    delta = {
+                        "tool_calls": [{
+                            "index": idx,
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
+                        }]
+                    }
+                    yield _sse_chunk(response_id, model, delta)
 
-        elif isinstance(event, SSETokens):
-            # Tokens emitted mid-stream; we'll include them in the final chunk
-            pass
+            elif isinstance(event, SSEToolResult):
+                logger.info("[openai][daemon] tool_result name=%s len=%d success=%s",
+                            event.name, len(event.output), event.success)
+                delta = {"content": f"\n\n**Tool result ({event.name}):**\n{event.output}\n"}
+                yield _sse_chunk(response_id, model, delta)
 
-        elif isinstance(event, SSEDone):
-            finish = "stop"
-            usage = {
-                "prompt_tokens": event.tokens.get("prompt", 0),
-                "completion_tokens": event.tokens.get("completion", 0),
-                "total_tokens": event.tokens.get("total", 0),
-            } if event.tokens else None
-            yield _sse_chunk(response_id, model, {}, finish_reason=finish, usage=usage)
-            yield "data: [DONE]\n\n"
-            return
+            elif isinstance(event, SSEArtifactStart):
+                logger.info("[openai][daemon] artifact_start id=%s lang=%s", event.id, event.language)
+                artifact_buffer[event.id] = ""
+                delta = {"content": f"\n\n```{event.language}\n"}
+                yield _sse_chunk(response_id, model, delta)
 
-        elif isinstance(event, SSEStopped):
-            yield _sse_chunk(response_id, model, {}, finish_reason="stop")
-            yield "data: [DONE]\n\n"
-            return
+            elif isinstance(event, SSEArtifactContent):
+                if event.id in artifact_buffer:
+                    artifact_buffer[event.id] += event.content
+                    delta = {"content": event.content}
+                    yield _sse_chunk(response_id, model, delta)
 
-        elif isinstance(event, SSEError):
-            delta = {"content": f"\n\n**Error:** {event.message}"}
-            yield _sse_chunk(response_id, model, delta, finish_reason="error")
-            yield "data: [DONE]\n\n"
-            return
+            elif isinstance(event, SSEArtifactEnd):
+                if event.id in artifact_buffer:
+                    logger.info("[openai][daemon] artifact_end id=%s total_len=%d",
+                                event.id, len(artifact_buffer[event.id]))
+                    yield _sse_chunk(response_id, model, {"content": "\n```\n"})
+                    artifact_buffer.pop(event.id, None)
+
+            elif isinstance(event, SSETokens):
+                logger.debug("[openai][daemon] tokens p=%d c=%d t=%d",
+                             event.prompt, event.completion, event.total)
+
+            elif isinstance(event, SSEDone):
+                logger.info("[openai][daemon] done — ending stream")
+                finish = "stop"
+                usage = {
+                    "prompt_tokens": event.tokens.get("prompt", 0),
+                    "completion_tokens": event.tokens.get("completion", 0),
+                    "total_tokens": event.tokens.get("total", 0),
+                } if event.tokens else None
+                if event.session_id:
+                    logger.info("[openai][daemon] session_id=%s", event.session_id)
+                yield _sse_chunk(response_id, model, {}, finish_reason=finish, usage=usage)
+                yield "data: [DONE]\n\n"
+                return
+
+            elif isinstance(event, SSEStopped):
+                logger.info("[openai][daemon] stopped")
+                yield _sse_chunk(response_id, model, {}, finish_reason="stop")
+                yield "data: [DONE]\n\n"
+                return
+
+            elif isinstance(event, SSEError):
+                logger.error("[openai][daemon] error: %s", event.message)
+                delta = {"content": f"\n\n**Error:** {event.message}"}
+                yield _sse_chunk(response_id, model, delta, finish_reason="error")
+                yield "data: [DONE]\n\n"
+                return
+
+            else:
+                logger.warning("[openai][daemon] unknown event type: %s", type(event).__name__)
+
+    finally:
+        # Cleanup tasks
+        if next_event_task and not next_event_task.done():
+            next_event_task.cancel()
+        if keepalive_task and not keepalive_task.done():
+            keepalive_task.cancel()
+        # Drain the generator in case the daemon still has data
+        # (prevents "async generator not exhausted" warnings)
+        if 'event_iter' in locals():
+            await event_iter.aclose()
 
     # Fallback
+    logger.info("[openai][daemon] stream ended naturally (fallback)")
     yield _sse_chunk(response_id, model, {}, finish_reason="stop")
     yield "data: [DONE]\n\n"
 
@@ -1054,6 +1190,8 @@ async def _run_daemon_task(task_id: str, chat_req: ChatRequest):
         async for event in _daemon_client.stream_chat(chat_req):
             if isinstance(event, SSEText):
                 logs.append(event.content)
+            elif isinstance(event, SSEToolBatch):
+                logs.append(f"\n[Tool calls: {', '.join(c.name for c in event.calls)}]\n")
             elif isinstance(event, SSEToolResult):
                 logs.append(f"\n[Tool: {event.name}]\n{event.output}\n")
             elif isinstance(event, SSEArtifactStart):
@@ -1062,6 +1200,9 @@ async def _run_daemon_task(task_id: str, chat_req: ChatRequest):
                 logs.append(event.content)
             elif isinstance(event, SSEArtifactEnd):
                 logs.append("\n```\n")
+            elif isinstance(event, SSETokens):
+                logger.debug("[task %s] tokens p=%d c=%d t=%d",
+                             task_id, event.prompt, event.completion, event.total)
             elif isinstance(event, SSEDone):
                 _update_task(task_id, status="completed")
                 break
@@ -1128,7 +1269,7 @@ if __name__ == "__main__":
         # Run uvicorn in background thread, GUI in main thread
         server = Server(
             Config(
-                "main:app",
+                app,
                 host=settings.host,
                 port=settings.port,
                 reload=False,           # reload forks -> incompatible with GUI thread
@@ -1145,7 +1286,7 @@ if __name__ == "__main__":
         import uvicorn
 
         uvicorn.run(
-            "main:app",
+            app,
             host=settings.host,
             port=settings.port,
             reload=settings.debug,

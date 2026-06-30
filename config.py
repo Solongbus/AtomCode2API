@@ -97,9 +97,8 @@ class Settings:
     task_timeout_seconds: int = 600  # 10 minutes
 
     # ── Lock file ──────────────────────────────────────────────────────
-    # Name of the temporary file created inside the workspace directory
-    # to signal that a task is currently modifying it.
-    lock_filename: str = ".atomcode.lock"
+    # Lock files are stored in the system temp directory (see utils/locker.py)
+    # so they never pollute the workspace.
 
     # ── Task status backend ────────────────────────────────────────────
     # How many recent log lines to keep per task in memory.

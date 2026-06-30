@@ -53,32 +53,17 @@ def _now_iso() -> str:
 
 
 def _filter_user_visible_output_line(text: str) -> str:
-    """Strip atomcode runtime/log noise from assistant-visible output.
+    """Filter out daemon/engine diagnostic lines from user-visible output.
 
-    Keep server-side logger output intact, but avoid returning engine / headless /
-    hook diagnostics as model content through the OpenAI API.
+    Lines starting with ``[engine`` or ``[headless`` are daemon-internal
+    diagnostics (model load, permission mode, etc.).  They still appear in
+    the server log (via ``logger.info``) for debugging, but are excluded
+    from the SSE stream sent to the IDE so the user only sees the AI's
+    actual thinking and execution output.
     """
     stripped = text.strip()
-    if not stripped:
-        return text
-
-    noisy_prefixes = (
-        "[engine ",
-        "engine v",
-        "[headless]",
-        "[SnapshotHook]",
-    )
-    if stripped.startswith(noisy_prefixes):
+    if stripped.startswith("[engine") or stripped.startswith("[headless"):
         return ""
-
-    noisy_contains = (
-        "save_snapshot failed",
-        "--dangerously-skip-permissions",
-        "new stack active (model",
-    )
-    if any(part in stripped for part in noisy_contains):
-        return ""
-
     return text
 
 
@@ -237,19 +222,78 @@ async def run_atomcode(task_id: str, prompt: str, project_path: str):
     logger.info("Task %s started (pid=%d, cwd=%s)", task_id, proc.pid, project_path)
 
     async def _read_stream():
-        """Read stdout line-by-one and update logs + server live log."""
+        """Read stdout line-by-one and update logs + server live log.
+
+        On Windows, atomcode.exe uses a launcher/engine split architecture:
+        the launcher process exits quickly and closes its stdout pipe handle,
+        but the real AI engine may continue running and producing output
+        through an inherited pipe handle.
+
+        Strategy:
+        1. First EOF: enter grace period (readline() with polling).
+        2. After grace: check if the process (or any child) is still alive
+           by testing the handle.  If so, keep polling — the engine may
+           produce more output.
+        3. Only declare the stream truly ended when the pipe is closed AND
+           the subprocess has exited, to ensure no late data is missed.
+        """
         assert proc.stdout is not None
         line_count = 0
+        eof_count = 0          # consecutive EOF polls
+        MAX_EOF_POLLS = 50     # ~15 s of grace (@ 0.3 s sleep)
+        _line_remainder = b""  # local buffer for partial-line coalescing
+
         while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            text = line.decode("utf-8", errors="replace").rstrip("\r\n")
-            filtered_text = _filter_user_visible_output_line(text)
-            if filtered_text:
-                _update_logs(task_id, filtered_text + "\n")
-            logger.info("[task %s] %s", task_id, text)
-            line_count += 1
+            # ── Try to read a chunk (non-line-buffered) ──────────────
+            try:
+                chunk = await asyncio.wait_for(
+                    proc.stdout.read(4096), timeout=0.3
+                )
+            except asyncio.TimeoutError:
+                chunk = b""
+
+            if chunk:
+                eof_count = 0
+                _line_remainder += chunk
+                # Emit complete lines, keep the partial tail.
+                *complete, tail = _line_remainder.split(b"\n")
+                _line_remainder = tail
+                for raw in complete:
+                    text = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                    filtered_text = _filter_user_visible_output_line(text)
+                    if filtered_text:
+                        _update_logs(task_id, filtered_text + "\n")
+                    logger.info("[task %s] %s", task_id, text)
+                    line_count += 1
+            else:
+                # ── No data this poll ────────────────────────────────
+                eof_count += 1
+                # If nothing in the partial buffer, check EOF conditions.
+                if not _line_remainder:
+                    # NOTE: On Windows, atomcode.exe uses a launcher/engine split
+                    # architecture. The launcher process (proc) exits quickly after
+                    # spawning the real AI engine, so `proc.returncode is not None`
+                    # does NOT mean output is done. We must NOT bail out early based
+                    # on launcher exit — instead rely solely on MAX_EOF_POLLS to
+                    # detect genuine pipe closure / engine termination.
+                    if eof_count > MAX_EOF_POLLS:
+                        logger.warning(
+                            "Task %s read stream timeout after %d polls (~%.0fs)",
+                            task_id,
+                            eof_count,
+                            eof_count * 0.3,
+                        )
+                        break
+                    await asyncio.sleep(0.3)
+                    continue
+
+        # Flush the final partial line (no trailing newline).
+        if _line_remainder:
+            text = _line_remainder.decode("utf-8", errors="replace").rstrip("\r\n")
+            if text:
+                _update_logs(task_id, text + "\n")
+                logger.info("[task %s] %s", task_id, text)
+                line_count += 1
 
         logger.info("Task %s stream ended (%d lines)", task_id, line_count)
 

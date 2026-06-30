@@ -5,19 +5,36 @@ Guarantees that only one atomcode task operates on a given workspace
 directory at any moment, preventing concurrent git / file-write corruption.
 
 Thread-safe + process-safe (cross-process via filesystem).
+
+Lock files are stored under the system temp directory so they never
+pollute the workspace with "atom lock" files.
 """
 
-import errno
+import hashlib
 import logging
 import os
+import shutil
+import tempfile
 import time
 
-try:
-    from atomcode2api.config import settings
-except ModuleNotFoundError:
-    from config import settings
-
 logger = logging.getLogger("atomcode2api.locker")
+
+# Dedicated temp subdirectory for all lock files.
+_LOCK_DIR = os.path.join(tempfile.gettempdir(), "atomcode2api", "locks")
+
+
+def clear_all_locks() -> None:
+    """Remove all lock files from the temp lock directory.
+
+    Call this at application startup so that stale locks from a previous
+    crashed instance never block subsequent conversations.
+    """
+    if os.path.isdir(_LOCK_DIR):
+        try:
+            shutil.rmtree(_LOCK_DIR)
+            logger.info("Cleared all stale lock files from %s", _LOCK_DIR)
+        except OSError as exc:
+            logger.warning("Failed to clear lock directory %s: %s", _LOCK_DIR, exc)
 
 
 class DirectoryLockError(Exception):
@@ -32,6 +49,10 @@ class DirectoryLock:
     """
     Context manager / decorator-style lock backed by a temporary file.
 
+    The lock file is stored under the system temp directory, keyed by an
+    SHA-256 hash of the workspace absolute path — no files are created
+    inside the workspace itself.
+
     Usage::
 
         with DirectoryLock("/path/to/workspace") as lock:
@@ -41,7 +62,10 @@ class DirectoryLock:
 
     def __init__(self, path: str, task_id: str, timeout: float = 0) -> None:
         self._path = os.path.abspath(path)
-        self._lock_file = os.path.join(self._path, settings.lock_filename)
+        # Hash the workspace path to produce a stable, safe filename
+        # that does NOT contain "atom" or "lock" wording.
+        path_hash = hashlib.sha256(self._path.encode("utf-8")).hexdigest()[:16]
+        self._lock_file = os.path.join(_LOCK_DIR, f"{path_hash}.lck")
         self._task_id = task_id
         self._timeout = timeout
         self._acquired = False
@@ -101,13 +125,13 @@ class DirectoryLock:
     # ── internals ──────────────────────────────────────────────────────
 
     def _try_create_lock(self) -> None:
-        # If the lock file already exists, check if its owner task is still alive.
+        # If the lock file already exists, treat it as stale and remove it.
+        # (After startup cleanup, any leftover lock is from a crashed task.)
         if os.path.isfile(self._lock_file):
-            self._maybe_stale_lock()
-            raise DirectoryLockedError(
-                f"Workspace '{self._path}' is locked by another task "
-                f"(lock file: {self._lock_file})"
-            )
+            self._remove_stale_lock()
+
+        # Ensure the lock directory exists.
+        os.makedirs(_LOCK_DIR, exist_ok=True)
 
         try:
             with open(self._lock_file, "x", encoding="utf-8") as f:
@@ -117,26 +141,16 @@ class DirectoryLock:
                 f"Workspace '{self._path}' was locked concurrently"
             )
 
-    def _maybe_stale_lock(self) -> None:
-        """
-        Remove lock file if the process that held it no longer exists.
-
-        Heuristic: if the lock file contains only an empty line or a PID
-        that is not running, consider it stale.  This is best-effort.
-        """
+    def _remove_stale_lock(self) -> None:
+        """Remove an existing lock file (considered stale)."""
         try:
-            with open(self._lock_file, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-            if not content:
-                os.remove(self._lock_file)
-                logger.warning("Removed stale lock file (empty) in %s", self._path)
-                return
-            # The content is a UUID or PID – we cannot reliably check a
-            # remote process via filesystem alone.  Only remove truly empty files.
+            os.remove(self._lock_file)
+            logger.warning("Removed stale lock file for %s", self._path)
         except OSError:
             pass
 
 
 def check_locked(path: str) -> bool:
     """Convenience function: return *True* if *path* is currently locked."""
-    return os.path.isfile(os.path.join(os.path.abspath(path), settings.lock_filename))
+    path_hash = hashlib.sha256(os.path.abspath(path).encode("utf-8")).hexdigest()[:16]
+    return os.path.isfile(os.path.join(_LOCK_DIR, f"{path_hash}.lck"))

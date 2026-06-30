@@ -19,10 +19,12 @@
 pip install -r requirements.txt
 
 # 2. 启动服务
-python -m uvicorn main:app --host 0.0.0.0 --port 8123
+python main.py
 ```
 
 或直接双击 `start_atomcode2api.bat`（Windows 一键启动）。
+
+**无需 Python 环境：** 若已构建为独立可执行文件，直接运行 `atomcode2api.exe` 即可（需保留完整的 `dist\atomcode2api\` 目录，`.exe` 不可单独拷贝）。
 
 ---
 
