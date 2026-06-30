@@ -12,19 +12,19 @@
 
 ---
 
-## 快速开始
+## 快速开始-A
+
+**无需 Python 环境：** 若已构建为独立可执行文件，直接运行 `atomcode2api.exe` 即可
+
+或
 
 ```bash
 # 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 启动服务
-python main.py
+# 2. 运行启动脚本
+start_atomcode2api.bat
 ```
-
-或直接双击 `start_atomcode2api.bat`（Windows 一键启动）。
-
-**无需 Python 环境：** 若已构建为独立可执行文件，直接运行 `atomcode2api.exe` 即可（需保留完整的 `dist\atomcode2api\` 目录，`.exe` 不可单独拷贝）。
 
 ---
 
