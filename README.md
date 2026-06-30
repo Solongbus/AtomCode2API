@@ -14,7 +14,7 @@
 
 ## 快速开始
 
-**无需 Python 环境：** 直接运行 `atomcode2api.exe` 即可
+**无需 Python 环境：** 直接运行 `atomcode2api.exe` 即可 [下载地址](https://github.com/Solongbus/AtomCode2API/releases)
 
 或
 
