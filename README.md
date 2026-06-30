@@ -10,6 +10,8 @@
 
 #### [点击这里注册](https://atomcode.atomgit.com/invite/UVMWDFM7)
 
+[![点击注册](images/atomcode_codingplan_lite.png)](https://atomcode.atomgit.com/invite/UVMWDFM7)
+
 ---
 
 ## 快速开始
