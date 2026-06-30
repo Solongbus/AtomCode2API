@@ -81,6 +81,7 @@ if settings.mode == "daemon":
             SSETokens,
         )
         from atomcode2api.daemon_manager import DaemonManager
+        from atomcode2api.utils.locker import clear_all_locks
     except ModuleNotFoundError:
         from daemon_client import (
             ChatRequest,
@@ -99,6 +100,7 @@ if settings.mode == "daemon":
             SSETokens,
         )
         from daemon_manager import DaemonManager
+        from utils.locker import clear_all_locks
 else:
     try:
         from atomcode2api.utils.executor import (
