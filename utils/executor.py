@@ -1,0 +1,300 @@
+"""
+Async subprocess runner for atomcode CLI.
+
+Spools real-time stdout/stderr into a thread-safe in-memory store
+so that the status endpoint can serve progressively-updated logs.
+
+Design decisions
+----------------
+- A plain ``dict`` guarded by a ``threading.Lock`` is used instead of
+  Redis for simplicity.  Swap it out when horizontal scaling is needed.
+- The subprocess is started with ``creationflags=CREATE_NO_WINDOW`` on
+  Windows so that no console window pops up.
+"""
+
+import asyncio
+import logging
+import os
+import shutil
+import subprocess
+import tempfile
+import sys
+import time
+from datetime import datetime, timezone
+from typing import Dict, Optional
+
+try:
+    from atomcode2api.config import settings
+except ModuleNotFoundError:
+    from config import settings
+
+try:
+    from atomcode2api.utils.locker import DirectoryLock, DirectoryLockedError
+except ModuleNotFoundError:
+    from utils.locker import DirectoryLock, DirectoryLockedError
+
+logger = logging.getLogger("atomcode2api.executor")
+
+# ── Task status constants ──────────────────────────────────────────────
+STATUS_QUEUED = "queued"
+STATUS_RUNNING = "running"
+STATUS_COMPLETED = "completed"
+STATUS_FAILED = "failed"
+
+# ── In-memory task store (thread-safe) ─────────────────────────────────
+import threading  # noqa: E402 (import after constants)
+
+_store_lock = threading.Lock()
+_tasks: Dict[str, dict] = {}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _filter_user_visible_output_line(text: str) -> str:
+    """Strip atomcode runtime/log noise from assistant-visible output.
+
+    Keep server-side logger output intact, but avoid returning engine / headless /
+    hook diagnostics as model content through the OpenAI API.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return text
+
+    noisy_prefixes = (
+        "[engine ",
+        "engine v",
+        "[headless]",
+        "[SnapshotHook]",
+    )
+    if stripped.startswith(noisy_prefixes):
+        return ""
+
+    noisy_contains = (
+        "save_snapshot failed",
+        "--dangerously-skip-permissions",
+        "new stack active (model",
+    )
+    if any(part in stripped for part in noisy_contains):
+        return ""
+
+    return text
+
+
+# ── Public helpers ─────────────────────────────────────────────────────
+
+
+def init_task(task_id: str, prompt: str, project_path: str) -> dict:
+    """Create a new task record and store it."""
+    record = {
+        "task_id": task_id,
+        "prompt": prompt,
+        "project_path": project_path,
+        "status": STATUS_QUEUED,
+        "logs": "",
+        "created_at": _now_iso(),
+        "updated_at": _now_iso(),
+    }
+    with _store_lock:
+        _tasks[task_id] = record
+    return record
+
+
+def get_task(task_id: str) -> Optional[dict]:
+    """Return a *copy* of the task record, or *None*."""
+    with _store_lock:
+        raw = _tasks.get(task_id)
+        if raw is None:
+            return None
+        return dict(raw)  # shallow copy
+
+
+def _update_logs(task_id: str, chunk: str):
+    """Append log chunk and set updated_at under lock."""
+    with _store_lock:
+        record = _tasks.get(task_id)
+        if record is None:
+            return
+        record["logs"] += chunk
+        # Keep only the last N lines to avoid unbounded memory growth.
+        lines = record["logs"].splitlines(keepends=True)
+        if len(lines) > settings.max_log_lines:
+            lines = lines[-settings.max_log_lines :]
+            lines.insert(0, "[truncated: earlier lines omitted]\n")
+        record["logs"] = "".join(lines)
+        record["updated_at"] = _now_iso()
+
+
+def _set_status(task_id: str, status: str):
+    with _store_lock:
+        record = _tasks.get(task_id)
+        if record is not None:
+            record["status"] = status
+            record["updated_at"] = _now_iso()
+
+
+# ── Background coroutine ───────────────────────────────────────────────
+
+
+async def run_atomcode(task_id: str, prompt: str, project_path: str):
+    """
+    Long-running background coroutine that:
+
+    1. Acquires a directory lock on *project_path*.
+    2. Spawns ``atomcode --execute <prompt> --yes`` as a subprocess.
+    3. Streams stdout/stderr into the task record.
+    4. Releases the lock on completion (success or failure).
+    """
+    lock = DirectoryLock(project_path, task_id)
+
+    # ── 1. Lock ────────────────────────────────────────────────────────
+    try:
+        lock.acquire()
+    except DirectoryLockedError as exc:
+        _set_status(task_id, STATUS_FAILED)
+        _update_logs(task_id, f"[lock-error] {exc}\n")
+        logger.error("Task %s failed to acquire lock: %s", task_id, exc)
+        return
+    except Exception as exc:
+        _set_status(task_id, STATUS_FAILED)
+        _update_logs(task_id, f"[lock-error] Unexpected: {exc}\n")
+        logger.exception("Task %s unexpected lock error", task_id)
+        return
+
+    # ── 2. Build command ───────────────────────────────────────────────
+    prompt_file_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".txt",
+            delete=False,
+        ) as tmp:
+            tmp.write(prompt)
+            prompt_file_path = tmp.name
+    except Exception as exc:
+        _set_status(task_id, STATUS_FAILED)
+        _update_logs(task_id, f"[start-error] failed to create prompt file: {exc}\n")
+        logger.exception("Task %s failed to create prompt file", task_id)
+        lock.release()
+        return
+
+    cmd = [settings.atomcode_bin, "--prompt-file", prompt_file_path]
+    cmd.extend(settings.atomcode_extra_args)
+
+    binary_path = settings.atomcode_bin
+    binary_exists = os.path.isfile(binary_path) if os.path.isabs(binary_path) else shutil.which(binary_path) is not None
+    logger.info(
+        "Task %s starting: cmd=%s cwd=%s binary_exists=%s",
+        task_id,
+        " ".join(cmd),
+        project_path,
+        binary_exists,
+    )
+
+    if os.path.isabs(binary_path) and not os.path.isfile(binary_path):
+        msg = f"[start-error] Binary path does not exist: {binary_path}\n"
+        _set_status(task_id, STATUS_FAILED)
+        _update_logs(task_id, msg)
+        logger.error("Task %s: %s", task_id, msg.strip())
+        lock.release()
+        return
+
+    creation_flags = 0
+    if os.name == "nt":
+        creation_flags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=project_path,
+            shell=False,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env={**os.environ},
+            creationflags=creation_flags,
+        )
+    except FileNotFoundError as exc:
+        msg = (
+            f"[start-error] Failed to launch binary '{settings.atomcode_bin}': {exc}. "
+            "This may indicate missing executable, missing runtime dependency, or environment restrictions.\n"
+        )
+        _set_status(task_id, STATUS_FAILED)
+        _update_logs(task_id, msg)
+        logger.error("Task %s: %s", task_id, msg.strip())
+        lock.release()
+        return
+    except Exception as exc:
+        _set_status(task_id, STATUS_FAILED)
+        _update_logs(task_id, f"[start-error] {exc}\n")
+        logger.exception("Task %s failed to start subprocess", task_id)
+        lock.release()
+        return
+
+    # ── 3. Stream output ───────────────────────────────────────────────
+    _set_status(task_id, STATUS_RUNNING)
+    logger.info("Task %s started (pid=%d, cwd=%s)", task_id, proc.pid, project_path)
+
+    async def _read_stream():
+        """Read stdout line-by-one and update logs + server live log."""
+        assert proc.stdout is not None
+        line_count = 0
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").rstrip("\r\n")
+            filtered_text = _filter_user_visible_output_line(text)
+            if filtered_text:
+                _update_logs(task_id, filtered_text + "\n")
+            logger.info("[task %s] %s", task_id, text)
+            line_count += 1
+
+        logger.info("Task %s stream ended (%d lines)", task_id, line_count)
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(_read_stream(), proc.wait()),
+            timeout=settings.task_timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        proc.terminate()
+        # Give it a few seconds to shut down gracefully, then force-kill.
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+
+        _set_status(task_id, STATUS_FAILED)
+        _update_logs(
+            task_id,
+            f"\n[timeout] Task exceeded {settings.task_timeout_seconds}s and was killed.\n",
+        )
+        logger.warning("Task %s timed out after %ds", task_id, settings.task_timeout_seconds)
+    except Exception as exc:
+        _set_status(task_id, STATUS_FAILED)
+        _update_logs(task_id, f"\n[error] {exc}\n")
+        logger.exception("Task %s encountered an unexpected error", task_id)
+    else:
+        # Normal completion – check return code.
+        returncode = proc.returncode
+        if returncode == 0:
+            _set_status(task_id, STATUS_COMPLETED)
+            logger.info("Task %s completed successfully", task_id)
+        else:
+            _set_status(task_id, STATUS_FAILED)
+            _update_logs(
+                task_id,
+                f"\n[exit] Process exited with code {returncode}\n",
+            )
+            logger.warning("Task %s failed with exit code %d", task_id, returncode)
+    finally:
+        if prompt_file_path:
+            try:
+                os.unlink(prompt_file_path)
+            except OSError:
+                pass
+        # ── 4. Always release the lock ─────────────────────────────────
+        lock.release()

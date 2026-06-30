@@ -1,0 +1,13 @@
+# Python 字节码缓存
+__pycache__/
+*.pyc
+
+# AtomCode 会话锁文件
+.atomcode.lock
+
+# 本地测试脚本（含硬编码密钥与本地地址）
+test_final.py
+
+output/
+
+_buildEXE.bat
