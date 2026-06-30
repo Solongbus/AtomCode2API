@@ -14,7 +14,7 @@
 
 ## 快速开始
 
-**无需 Python 环境：** 若已构建为独立可执行文件，直接运行 `atomcode2api.exe` 即可
+**无需 Python 环境：** 直接运行 `atomcode2api.exe` 即可
 
 或
 
